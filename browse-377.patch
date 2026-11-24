@@ -1,0 +1,572 @@
+diff --git a/README.md b/README.md
+index cc002e4..b8553a5 100644
+--- a/README.md
++++ b/README.md
+@@ -333,6 +333,7 @@ when it starts: it stops after 30 minutes without use, or run `browse restart` f
+ | `OPENCODE_BROWSER_FILE_ROOTS` | More folders tools may read and write (path-list separated) |
+ | `OPENCODE_BROWSER_AGENT_WINDOW=separate` | Open agent tabs in a separate window (`current`: in yours), overriding the options page |
+ | `OPENCODE_BROWSER_HUMAN_INPUT=0` | Send input at full speed; overrides the options page |
++| `OPENCODE_BROWSER_IDLE_TAB_TTL_MS=900000` | How long an untouched agent tab waits before the relay closes it, in milliseconds (0: never); overrides the options page's idle setting |
+ | `OPENCODE_BROWSER_AUTO_UPDATE=notify` | Only tell about new versions (`off`: check, but never install or tell; `on`: install them, the default) |
+ | `OPENCODE_BROWSER_CHALLENGE_WAIT_MS=15000` | How long to wait for a bot check the browser clears by itself |
+ | `OPENCODE_BROWSER_EXTENSION_TIMEOUT_MS=30000` | How long the relay waits for the extension to answer a command |
+diff --git a/cli/src/relay.ts b/cli/src/relay.ts
+index d7d285b..29d2868 100644
+--- a/cli/src/relay.ts
++++ b/cli/src/relay.ts
+@@ -272,6 +272,21 @@ const makeRelay = Effect.fnUntraced(function* (options: {
+   const executeTimeoutMs = yield* configuredExecuteTimeoutMs
+   const keepaliveIntervalMs = yield* Config.Int("OPENCODE_BROWSER_KEEPALIVE_MS").pipe(Config.withDefault(20_000))
+   const idleTabTtlMs = yield* Config.Int("OPENCODE_BROWSER_IDLE_TAB_TTL_MS").pipe(Config.withDefault(15 * 60_000))
++  // The extension's idle-close setting wins over that default (0: never); the
++  // environment variable above still wins over the extension when it is set.
++  const idleTabTtlMsEnv = (() => {
++    const raw = process.env.OPENCODE_BROWSER_IDLE_TAB_TTL_MS?.trim()
++    if (!raw) return undefined
++    const ms = Number(raw)
++    return Number.isFinite(ms) && ms >= 0 ? ms : undefined
++  })()
++  const effectiveIdleTabTtlMs = (): number => {
++    if (idleTabTtlMsEnv !== undefined) return idleTabTtlMsEnv
++    const minutes = browsers.defaultLink()?.idleMinutes
++    if (minutes === 0) return 0
++    if (minutes !== undefined) return minutes * 60_000
++    return idleTabTtlMs
++  }
+   const journalBaseDir = defaultJournalBaseDir()
+   // Tabs that received a device-metrics override; the execute end clears only these.
+   const deviceMetricsOverrides = new DeviceMetricsOverrides()
+@@ -521,7 +536,7 @@ const makeRelay = Effect.fnUntraced(function* (options: {
+     restartTimeoutMs,
+     releaseTargetGraceMs,
+     clientGoneGraceMs,
+-    idleTabTtlMs,
++    idleTabTtlMs: effectiveIdleTabTtlMs,
+     keepaliveIntervalMs,
+     journalBaseDir,
+     sessions,
+diff --git a/cli/src/relay/browser-links.ts b/cli/src/relay/browser-links.ts
+index 20bcf92..1a65d41 100644
+--- a/cli/src/relay/browser-links.ts
++++ b/cli/src/relay/browser-links.ts
+@@ -52,6 +52,8 @@ export type BrowserLink = {
+   readonly announcedAgentTabIds: Set<number>
+   /** The status page's input setting this browser sent. */
+   humanInput: boolean | undefined
++  /** The status page's idle-close setting this browser sent, in minutes (0: never). */
++  idleMinutes: number | undefined
+   /** Its settings answer came before the relay marked it ready, so `relay.settings` is sent once it is. */
+   pendingRelaySettings?: boolean
+   /** It runs on this computer (not over the network), so its unpacked extension is this computer's folder. */
+@@ -133,6 +135,7 @@ export class BrowserLinks {
+       announcedRootTabIds: new Set(),
+       announcedAgentTabIds: new Set(),
+       humanInput: undefined,
++      idleMinutes: undefined,
+       local: false,
+     }
+     link.rpc.replaceSocket(options.socket)
+diff --git a/cli/src/relay/housekeeping.ts b/cli/src/relay/housekeeping.ts
+index 60be0ab..fb92192 100644
+--- a/cli/src/relay/housekeeping.ts
++++ b/cli/src/relay/housekeeping.ts
+@@ -43,7 +43,8 @@ export function createRelayHousekeeping(options: {
+   readonly restartTimeoutMs: number
+   readonly releaseTargetGraceMs: number
+   readonly clientGoneGraceMs: number
+-  readonly idleTabTtlMs: number
++  /** Read every minute: the extension's idle-close setting can change it, and 0 disables reaping. */
++  readonly idleTabTtlMs: () => number
+   readonly keepaliveIntervalMs: number
+   readonly journalBaseDir: string
+   readonly sessions: OpenCodeBrowserSessions
+@@ -232,25 +233,25 @@ export function createRelayHousekeeping(options: {
+       }, keepaliveIntervalMs)
+       keepaliveTimer.unref()
+     }
+-    if (idleTabTtlMs > 0) {
+-      idleReapTimer = setInterval(() => {
+-        if (!shutdown.accepting) return
+-        Effect.runPromise(
+-          sessions.reapIdleSessions({
+-            maxIdleMs: idleTabTtlMs,
+-            isTargetBusy: (targetId) => {
+-              const target = registry.targetsByTargetId.get(targetId)
+-              return target ? isTabBusy(target.tabId) : false
+-            },
+-          }).pipe(Effect.andThen(() => Effect.forEach(
+-            tabActivity.idleUserTargets(registry.listRootTargets(), Date.now(), idleTabTtlMs),
+-            (target) => detachIdleUserTarget(target.targetInfo.targetId).pipe(Effect.ignore),
+-            { discard: true },
+-          ))),
+-        ).catch(() => {})
+-      }, 60_000)
+-      idleReapTimer.unref()
+-    }
++    idleReapTimer = setInterval(() => {
++      if (!shutdown.accepting) return
++      const ttlMs = idleTabTtlMs()
++      if (ttlMs <= 0) return
++      Effect.runPromise(
++        sessions.reapIdleSessions({
++          maxIdleMs: ttlMs,
++          isTargetBusy: (targetId) => {
++            const target = registry.targetsByTargetId.get(targetId)
++            return target ? isTabBusy(target.tabId) : false
++          },
++        }).pipe(Effect.andThen(() => Effect.forEach(
++          tabActivity.idleUserTargets(registry.listRootTargets(), Date.now(), ttlMs),
++          (target) => detachIdleUserTarget(target.targetInfo.targetId).pipe(Effect.ignore),
++          { discard: true },
++        ))),
++      ).catch(() => {})
++    }, 60_000)
++    idleReapTimer.unref()
+   }
+ 
+   /** Idempotent, and safe on the listen-failure path before startTimers has ever run. */
+diff --git a/cli/src/relay/settings-sync.ts b/cli/src/relay/settings-sync.ts
+index 278b0b6..73ed646 100644
+--- a/cli/src/relay/settings-sync.ts
++++ b/cli/src/relay/settings-sync.ts
+@@ -10,6 +10,7 @@ import { relayLog } from "./log.ts"
+ import {
+   describeChanges,
+   describeSettings,
++  idleTabTtlOverride,
+   parseSettingChanges,
+   settingsFromExtension,
+   SettingsInputError,
+@@ -35,9 +36,11 @@ export function createRelaySettingsSync(options: {
+   const userSettingOverrides = (): SettingOverrides => {
+     const human = humanInputOverride()
+     const autoUpdate = autoUpdateOverride()
++    const idleTtl = idleTabTtlOverride()
+     return {
+       ...(autoUpdate ? { autoUpdate: { variable: process.env.OPENCODE_BROWSER_AUTO_UPDATE !== undefined ? "OPENCODE_BROWSER_AUTO_UPDATE" : "OPENCODE_BROWSER_UPDATE_CHECK", value: autoUpdate } } : {}),
+       ...(agentWindow ? { window: { variable: "OPENCODE_BROWSER_AGENT_WINDOW", value: agentWindow } } : {}),
++      ...(idleTtl === undefined ? {} : { idleMinutes: { variable: "OPENCODE_BROWSER_IDLE_TAB_TTL_MS", value: idleTtl } }),
+       ...(human === undefined ? {} : { humanInput: { variable: "OPENCODE_BROWSER_HUMAN_INPUT", value: human ? "on" : "off" } }),
+     }
+   }
+@@ -85,12 +88,14 @@ export function createRelaySettingsSync(options: {
+   const applyExtensionSettings = (link: BrowserLink, params: JsonObject | undefined): void => {
+     const human = params?.humanInput
+     if (human === "on" || human === "off") link.humanInput = human === "on"
++    const idle = params?.idleMinutes
++    if (typeof idle === "number" && Number.isFinite(idle) && idle >= 0) link.idleMinutes = idle
+     const autoUpdate = params?.autoUpdate
+     if (typeof autoUpdate === "string" && (autoUpdateModes as readonly string[]).includes(autoUpdate)) {
+       setStoredMode(autoUpdate as AutoUpdateMode)
+       relayLog("autoupdate.mode", { mode: autoUpdate })
+     }
+-    relayLog("extension.settings", { browser: link.id, humanInput: humanInputEnabled(link.humanInput) ? "on" : "off" })
++    relayLog("extension.settings", { browser: link.id, humanInput: humanInputEnabled(link.humanInput) ? "on" : "off", idleMinutes: link.idleMinutes ?? "unset" })
+     if (link.rpc.connected) sendRelaySettings()
+     else link.pendingRelaySettings = true
+   }
+diff --git a/cli/src/relay/user-settings.ts b/cli/src/relay/user-settings.ts
+index d6db894..2ebd892 100644
+--- a/cli/src/relay/user-settings.ts
++++ b/cli/src/relay/user-settings.ts
+@@ -21,7 +21,7 @@ export const settingSpecs: Record<SettingKey, { readonly label: string; readonly
+   window: { label: "Where agents open their tabs (current: the user's window; separate: an unfocused window of their own)", values: ["current", "separate"], variable: "OPENCODE_BROWSER_AGENT_WINDOW" },
+   grouping: { label: "How agent tabs are grouped (one shared group, one group per session, or none)", values: ["shared", "session", "none"] },
+   groupCollapse: { label: "Whether browse collapses agent groups by itself (auto: fold them away unless the user is on one; off: leave each group as the user set it)", values: ["auto", "off"] },
+-  idleMinutes: { label: "Close agent tabs untouched for this many minutes", values: [10, 30, 60, "never"] },
++  idleMinutes: { label: "Close agent tabs untouched for this many minutes", values: [10, 30, 60, "never"], variable: "OPENCODE_BROWSER_IDLE_TAB_TTL_MS" },
+   humanInput: { label: "Human-like input (off is faster, but easier for sites to flag)", values: ["on", "off"], variable: "OPENCODE_BROWSER_HUMAN_INPUT" },
+   muteTabs: { label: "Mute the tabs agents open (on keeps them quiet)", values: ["on", "off"] },
+   handoffNotifications: { label: "System notification on a handoff (only while recorded, or every handoff)", values: ["recording", "always"] },
+@@ -40,6 +40,16 @@ export const securityVariables = [
+ 
+ export class SettingsInputError extends Error {}
+ 
++/** OPENCODE_BROWSER_IDLE_TAB_TTL_MS, when set: it wins over the extension's idleMinutes. 0 disables idle closing. */
++export function idleTabTtlOverride(): number | "never" | undefined {
++  const raw = process.env.OPENCODE_BROWSER_IDLE_TAB_TTL_MS?.trim()
++  if (!raw) return undefined
++  const ms = Number(raw)
++  if (!Number.isFinite(ms) || ms < 0) return undefined
++  if (ms === 0) return "never"
++  return Math.max(1, Math.round(ms / 60_000))
++}
++
+ const allowed = (key: SettingKey) => settingSpecs[key].values.map(String).join(", ")
+ 
+ /**
+diff --git a/rust/crates/browse-relay/src/link.rs b/rust/crates/browse-relay/src/link.rs
+index 8162b98..68a7363 100644
+--- a/rust/crates/browse-relay/src/link.rs
++++ b/rust/crates/browse-relay/src/link.rs
+@@ -91,6 +91,8 @@ pub struct Link {
+     probing: AtomicBool,
+     pub pong: Notify,
+     pub human_input: Mutex<Option<bool>>,
++    /// The extension's idle-close setting, in minutes (0: never). None: it never sent one.
++    pub idle_minutes: Mutex<Option<u64>>,
+     pub pending_relay_settings: AtomicBool,
+     pub announced: Mutex<HashSet<i64>>,
+     pub announced_agent: Mutex<HashSet<i64>>,
+@@ -139,6 +141,7 @@ impl Link {
+             probing: AtomicBool::new(false),
+             pong: Notify::new(),
+             human_input: Mutex::new(None),
++            idle_minutes: Mutex::new(None),
+             pending_relay_settings: AtomicBool::new(false),
+             announced: Mutex::new(HashSet::new()),
+             announced_agent: Mutex::new(HashSet::new()),
+@@ -187,6 +190,10 @@ impl Link {
+         *self.human_input.lock().unwrap()
+     }
+ 
++    pub fn idle_minutes(&self) -> Option<u64> {
++        *self.idle_minutes.lock().unwrap()
++    }
++
+     pub fn send_raw(&self, value: &Value) {
+         let _ = self.out.send(Message::Text(value.to_string().into()));
+     }
+diff --git a/rust/crates/browse-relay/src/presentation.rs b/rust/crates/browse-relay/src/presentation.rs
+index f804223..bc46bde 100644
+--- a/rust/crates/browse-relay/src/presentation.rs
++++ b/rust/crates/browse-relay/src/presentation.rs
+@@ -430,11 +430,14 @@ impl Relay {
+             Some("off") => *link.human_input.lock().unwrap() = Some(false),
+             _ => {}
+         }
++        if let Some(minutes) = params.get("idleMinutes").and_then(Value::as_u64) {
++            *link.idle_minutes.lock().unwrap() = Some(minutes);
++        }
+         if let Some(mode) = params.get("autoUpdate").and_then(Value::as_str).filter(|m| matches!(*m, "on" | "notify" | "off")) {
+             self.store_auto_update_mode(mode);
+             rlog!("autoupdate.mode", mode = mode);
+         }
+-        rlog!("extension.settings", browser = link.id.clone(), humanInput = if self.human_input_for_link(link) { "on" } else { "off" });
++        rlog!("extension.settings", browser = link.id.clone(), humanInput = if self.human_input_for_link(link) { "on" } else { "off" }, idleMinutes = link.idle_minutes().map(|m| m.to_string()).unwrap_or_else(|| "unset".to_string()));
+         if link.connected() {
+             self.send_relay_settings(None);
+         } else {
+diff --git a/rust/crates/browse-relay/src/relay.rs b/rust/crates/browse-relay/src/relay.rs
+index 2b8fb23..7637098 100644
+--- a/rust/crates/browse-relay/src/relay.rs
++++ b/rust/crates/browse-relay/src/relay.rs
+@@ -479,6 +479,20 @@ fn env_ms(variable: &str, fallback: u64) -> Option<Duration> {
+     (value > 0).then(|| Duration::from_millis(value))
+ }
+ 
++/// The idle-close TTL in effect: the environment variable wins when set (0 disables idle
++/// closing), then the default browser's idleMinutes from the extension (0 is never), then the
++/// relay's configured default.
++pub fn resolve_idle_ttl(env: Option<Option<Duration>>, extension_minutes: Option<u64>, fallback: Option<Duration>) -> Option<Duration> {
++    if let Some(ttl) = env {
++        return ttl;
++    }
++    match extension_minutes {
++        Some(0) => None,
++        Some(minutes) => Some(Duration::from_secs(minutes * 60)),
++        None => fallback,
++    }
++}
++
+ impl Relay {
+     pub fn new(config: RelayConfig) -> anyhow::Result<Arc<Self>> {
+         crate::paths::ensure_private_dir(&config.paths.data)?;
+@@ -549,6 +563,12 @@ impl Relay {
+         self.me.upgrade().expect("the relay outlives its work")
+     }
+ 
++    /// The idle-close TTL the housekeeping sweep uses right now.
++    pub fn effective_idle_ttl(&self) -> Option<Duration> {
++        let extension = self.st().default_link().and_then(|link| link.idle_minutes());
++        resolve_idle_ttl(crate::settings::idle_ttl_override(), extension, self.idle_tab_ttl)
++    }
++
+     /// The relay's state. The lock is not re-entrant: taking it again on a thread that holds it panics instead of
+     /// deadlocking (a temporary guard in an `if let`/`match` scrutinee lives for the whole block). Whoever holds it
+     /// is recorded for the watchdog, which ends a relay whose lock stays held.
+@@ -802,9 +822,24 @@ pub fn file_roots() -> Vec<PathBuf> {
+ 
+ #[cfg(test)]
+ mod tests {
++    use super::*;
++
+     #[test]
+     fn slugs() {
+         assert_eq!(super::browser_slug("Chrome on Dax's MacBook Pro"), "chrome-daxs-macbook-pro");
+         assert_eq!(super::browser_slug("!!!"), "browser");
+     }
++
++    #[test]
++    fn resolves_the_idle_ttl() {
++        let fallback = Some(Duration::from_secs(900));
++        // The environment wins when set, including 0 to disable idle closing.
++        assert_eq!(resolve_idle_ttl(Some(Some(Duration::from_secs(60))), Some(0), fallback), Some(Duration::from_secs(60)));
++        assert_eq!(resolve_idle_ttl(Some(None), Some(0), fallback), None);
++        // Otherwise the extension's setting wins: 0 is never, a number is minutes.
++        assert_eq!(resolve_idle_ttl(None, Some(0), fallback), None);
++        assert_eq!(resolve_idle_ttl(None, Some(30), fallback), Some(Duration::from_secs(1800)));
++        // An extension that never sent one leaves the configured default.
++        assert_eq!(resolve_idle_ttl(None, None, fallback), fallback);
++    }
+ }
+diff --git a/rust/crates/browse-relay/src/serve.rs b/rust/crates/browse-relay/src/serve.rs
+index 60e20a8..5c468c2 100644
+--- a/rust/crates/browse-relay/src/serve.rs
++++ b/rust/crates/browse-relay/src/serve.rs
+@@ -786,16 +786,19 @@ async fn housekeeping(relay: Arc<Relay>) {
+                 });
+             }
+         }
+-        if let Some(ttl) = relay.idle_tab_ttl.filter(|_| now - last_reap >= Duration::from_secs(60)) {
++        if now - last_reap >= Duration::from_secs(60) {
+             last_reap = now;
+             // Tabs no call used for the idle TTL: an agent's closes, a lent one goes back to the user.
+-            let idle: Vec<(i64, crate::relay::Owner)> = relay.idle_tabs(ttl);
+-            for (tab, owner) in idle {
+-                rlog!("tab.reaped", tabId = tab, owner = owner.name());
+-                if owner == crate::relay::Owner::User {
+-                    let _ = relay.detach_tab(tab, "idle").await;
+-                } else if relay.ext_tab(tab, "tabs.remove", json!({})).await.is_ok() {
+-                    relay.remove_tab(tab, crate::tabs::Release { gone: true, ..Default::default() }, "idle");
++            // No TTL (idleMinutes never, or a zero OPENCODE_BROWSER_IDLE_TAB_TTL_MS) leaves them alone.
++            if let Some(ttl) = relay.effective_idle_ttl() {
++                let idle: Vec<(i64, crate::relay::Owner)> = relay.idle_tabs(ttl);
++                for (tab, owner) in idle {
++                    rlog!("tab.reaped", tabId = tab, owner = owner.name());
++                    if owner == crate::relay::Owner::User {
++                        let _ = relay.detach_tab(tab, "idle").await;
++                    } else if relay.ext_tab(tab, "tabs.remove", json!({})).await.is_ok() {
++                        relay.remove_tab(tab, crate::tabs::Release { gone: true, ..Default::default() }, "idle");
++                    }
+                 }
+             }
+         }
+diff --git a/rust/crates/browse-relay/src/settings.rs b/rust/crates/browse-relay/src/settings.rs
+index aa1e479..3ff41fa 100644
+--- a/rust/crates/browse-relay/src/settings.rs
++++ b/rust/crates/browse-relay/src/settings.rs
+@@ -1,6 +1,8 @@
+ //! The user's browse settings (cli/src/relay/user-settings.ts): the extension's options page owns them; the relay
+ //! reads and writes them through it (`settings.get`, `settings.set`). Environment variables on the relay override some.
+ 
++use std::time::Duration;
++
+ use serde_json::{Map, Value, json};
+ 
+ pub const AGENT_KEYS: [&str; 7] = ["window", "grouping", "groupCollapse", "idleMinutes", "humanInput", "muteTabs", "handoffNotifications"];
+@@ -50,12 +52,34 @@ pub fn human_input_override() -> Option<bool> {
+     (!value.is_empty()).then(|| !matches!(value.to_lowercase().as_str(), "0" | "false" | "off" | "no"))
+ }
+ 
++/// OPENCODE_BROWSER_IDLE_TAB_TTL_MS, parsed from its raw value so tests need no environment:
++/// None is unset or invalid, Some(None) is 0 (idle closing off), Some(Some(_)) is the TTL.
++pub fn parse_idle_ttl_ms(raw: Option<String>) -> Option<Option<Duration>> {
++    let ms = raw?.trim().parse::<u64>().ok()?;
++    Some((ms > 0).then(|| Duration::from_millis(ms)))
++}
++
++/// OPENCODE_BROWSER_IDLE_TAB_TTL_MS, when set: it wins over the extension's idleMinutes.
++pub fn idle_ttl_override() -> Option<Option<Duration>> {
++    parse_idle_ttl_ms(std::env::var("OPENCODE_BROWSER_IDLE_TAB_TTL_MS").ok())
++}
++
+ /// The settings the relay's environment fixes: key -> (variable, value).
+ pub fn overrides() -> Vec<(&'static str, &'static str, String)> {
+     let mut out = Vec::new();
+     if let Some(window) = agent_window_override() {
+         out.push(("window", "OPENCODE_BROWSER_AGENT_WINDOW", window.to_string()));
+     }
++    if let Some(ttl) = idle_ttl_override() {
++        out.push((
++            "idleMinutes",
++            "OPENCODE_BROWSER_IDLE_TAB_TTL_MS",
++            match ttl {
++                None => "never".to_string(),
++                Some(d) => (d.as_secs() / 60).max(1).to_string(),
++            },
++        ));
++    }
+     if let Some(human) = human_input_override() {
+         out.push(("humanInput", "OPENCODE_BROWSER_HUMAN_INPUT", if human { "on" } else { "off" }.to_string()));
+     }
+@@ -251,4 +275,17 @@ mod tests {
+         let odd = from_extension(&json!({ "settings": { "muteTabs": "sometimes" } })).unwrap();
+         assert_eq!(lookup(&odd, "muteTabs"), "off", "only on is on");
+     }
++
++    #[test]
++    fn parses_the_idle_ttl_override() {
++        assert_eq!(parse_idle_ttl_ms(None), None);
++        assert_eq!(parse_idle_ttl_ms(Some("".into())), None);
++        assert_eq!(parse_idle_ttl_ms(Some("soon".into())), None);
++        assert_eq!(parse_idle_ttl_ms(Some("-5".into())), None);
++        assert_eq!(parse_idle_ttl_ms(Some("0".into())), Some(None));
++        assert_eq!(
++            parse_idle_ttl_ms(Some("900000".into())),
++            Some(Some(Duration::from_secs(900)))
++        );
++    }
+ }
+diff --git a/rust/crates/browse-relay/src/tests.rs b/rust/crates/browse-relay/src/tests.rs
+index 7253a74..c710a0b 100644
+--- a/rust/crates/browse-relay/src/tests.rs
++++ b/rust/crates/browse-relay/src/tests.rs
+@@ -1,7 +1,7 @@
+ //! The relay against a fake extension speaking the real wire protocol: pairing, CDP routing, agent tabs (each its own
+ //! handle), lent tabs, restarts, the HTTP API.
+ 
+-use std::collections::{HashMap, VecDeque};
++use std::collections::{HashMap, HashSet, VecDeque};
+ use std::sync::{Arc, Mutex};
+ use std::time::Duration;
+ 
+@@ -689,6 +689,58 @@ fn the_state_lock_can_be_taken_again_once_released() {
+     let _ = std::fs::remove_dir_all(&paths.data);
+ }
+ 
++#[test]
++fn extension_idle_setting_reaches_the_idle_sweep() {
++    let paths = Paths::rooted(
++        std::env::temp_dir().join(format!("browse-relay-idle-{}", crate::util::random_hex(6))),
++    );
++    let relay = crate::relay::Relay::new(crate::relay::RelayConfig {
++        paths: paths.clone(),
++        configured_port: 0,
++        port: 0,
++        host: "127.0.0.1".into(),
++        version: "0".into(),
++        build_id: String::new(),
++        auto_update: None,
++    })
++    .unwrap();
++    // No browser connected: the configured 15-minute default stands.
++    assert_eq!(relay.effective_idle_ttl(), Some(Duration::from_secs(900)));
++    let (out, _rx) = mpsc::unbounded_channel();
++    let link = Arc::new(crate::link::Link::new(
++        crate::link::LinkInfo {
++            key: "chrome-test".into(),
++            id: "chrome-test".into(),
++            name: "Chrome".into(),
++            generation: 1,
++            version: None,
++            build: None,
++            origin: None,
++            protocol: crate::protocol::compatibility(None),
++            capabilities: HashSet::new(),
++            local: true,
++        },
++        out,
++        crate::link::Timeouts::from_env(),
++    ));
++    assert_eq!(link.idle_minutes(), None);
++    relay.apply_extension_settings(&link, &json!({ "humanInput": "on", "idleMinutes": 0 }));
++    assert_eq!(link.idle_minutes(), Some(0));
++    // An older extension that never sends idleMinutes leaves the stored value alone.
++    relay.apply_extension_settings(&link, &json!({ "humanInput": "on" }));
++    assert_eq!(link.idle_minutes(), Some(0));
++    // The sweep sees the setting once the link is the default browser.
++    relay.st().links.push(link.clone());
++    assert_eq!(
++        relay.effective_idle_ttl(),
++        None,
++        "idleMinutes never disables the sweep"
++    );
++    relay.apply_extension_settings(&link, &json!({ "idleMinutes": 30 }));
++    assert_eq!(relay.effective_idle_ttl(), Some(Duration::from_secs(1800)));
++    let _ = std::fs::remove_dir_all(&paths.data);
++}
++
+ #[test]
+ fn an_address_never_replaces_a_known_browser_name() {
+     let paths = Paths::rooted(std::env::temp_dir().join(format!("browse-relay-names-{}", crate::util::random_hex(6))));
+diff --git a/src/background/agent-relay.ts b/src/background/agent-relay.ts
+index 1bbe5f3..393569e 100644
+--- a/src/background/agent-relay.ts
++++ b/src/background/agent-relay.ts
+@@ -12,8 +12,10 @@ import {
+ } from "../agent-relay/protocol"
+ import {
+   HUMAN_INPUT_KEY,
++  IDLE_MINUTES_KEY,
+   MUTE_TABS_KEY,
+   humanInput,
++  idleMinutesSetting,
+   muteTabs,
+   RELAY_ADDRESS_KEY,
+   type AgentRelayState,
+@@ -300,9 +302,10 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
+   // The relay-side settings apply as soon as they change; the relay answers with what its environment fixes.
+   const sendSettings = async () => {
+     if (!open()) return
+-    const stored = await chrome.storage.local.get([HUMAN_INPUT_KEY])
++    const stored = await chrome.storage.local.get([HUMAN_INPUT_KEY, IDLE_MINUTES_KEY])
+     const settings: RelaySettings = {
+       humanInput: humanInput(stored[HUMAN_INPUT_KEY]),
++      idleMinutes: idleMinutesSetting(stored[IDLE_MINUTES_KEY]),
+     }
+     log.add("settings", settings)
+     send({ method: "settings", params: settings })
+@@ -605,7 +608,7 @@ export function createAgentRelay(input: { changed: (state: AgentRelayState) => v
+     if (alarm.name === ALARM) void connect("alarm")
+   })
+   chrome.storage.onChanged.addListener((changes, area) => {
+-    if (area === "local" && HUMAN_INPUT_KEY in changes) void sendSettings()
++    if (area === "local" && (HUMAN_INPUT_KEY in changes || IDLE_MINUTES_KEY in changes)) void sendSettings()
+     if (area === "local" && MUTE_TABS_KEY in changes)
+       void TabCleanup.setMuted(muteTabs(changes[MUTE_TABS_KEY]?.newValue) === "on").catch(() => undefined)
+   })
+diff --git a/src/shared/protocol.ts b/src/shared/protocol.ts
+index 4e081aa..0b565db 100644
+--- a/src/shared/protocol.ts
++++ b/src/shared/protocol.ts
+@@ -243,7 +243,7 @@ export type HandoffNotifications = "recording" | "always"
+ export const handoffNotifications = (value: unknown): HandoffNotifications => (value === "always" ? "always" : "recording")
+ 
+ /** The settings the relay applies, sent to it after pairing and whenever they change (the `settings` event). */
+-export type RelaySettings = { humanInput: HumanInput }
++export type RelaySettings = { humanInput: HumanInput; idleMinutes: number }
+ 
+ /** Settings the relay's environment fixes, whatever the status page says (the relay's `relay.settings` answer). */
+ export type RelayOverrides = { agentWindow?: "current" | "separate"; humanInput?: HumanInput }
+diff --git a/test/isolated/agent-relay-grouping.ts b/test/isolated/agent-relay-grouping.ts
+index bba374a..892f0a3 100644
+--- a/test/isolated/agent-relay-grouping.ts
++++ b/test/isolated/agent-relay-grouping.ts
+@@ -628,17 +628,23 @@ describe("toolbar clicks that can't attach", () => {
+ })
+ 
+ describe("relay settings", () => {
+-  test("the extension sends the input setting, again when it changes, and never invalid values", async () => {
++  test("the extension sends the input and idle settings, again when they change, and never invalid values", async () => {
+     // The first connection's settings went out with pairing (beforeEach cleared the log); ask again.
+     await stub.chrome.storage.local.set({ humanInput: "off" })
+     await until(() => settings().length === 1)
+-    expect(settings()[0]).toEqual({ humanInput: "off" })
++    expect(settings()[0]).toEqual({ humanInput: "off", idleMinutes: 10 })
+     await stub.chrome.storage.local.set({ humanInput: "on" })
+     await until(() => settings().length === 2)
+-    expect(settings()[1]).toEqual({ humanInput: "on" })
++    expect(settings()[1]).toEqual({ humanInput: "on", idleMinutes: 10 })
+     await stub.chrome.storage.local.set({ humanInput: 3 })
+     await until(() => settings().length === 3)
+-    expect(settings()[2]).toEqual({ humanInput: "on" })
++    expect(settings()[2]).toEqual({ humanInput: "on", idleMinutes: 10 })
++    await stub.chrome.storage.local.set({ tabCleanupIdleMinutes: 0 })
++    await until(() => settings().length === 4)
++    expect(settings()[3]).toEqual({ humanInput: "on", idleMinutes: 0 })
++    await stub.chrome.storage.local.set({ tabCleanupIdleMinutes: "soon" })
++    await until(() => settings().length === 5)
++    expect(settings()[4]).toEqual({ humanInput: "on", idleMinutes: 10 })
+   })
+ 
+   test("the relay's overrides show on the status page; unknown ones are dropped, and they go with the connection", async () => {
+@@ -680,7 +686,7 @@ describe("the relay's settings tool", () => {
+     })
+     expect(pageSaw).toEqual([{ agentTabsGrouping: "shared", agentTabsGroupCollapse: "off", muteTabs: "on", humanInput: "off", tabCleanupIdleMinutes: 0, handoffNotifications: "always" }])
+     await until(() => settings().length === 1)
+-    expect(settings()[0]).toEqual({ humanInput: "off" })
++    expect(settings()[0]).toEqual({ humanInput: "off", idleMinutes: 0 })
+     await userWindow()
+     const agent = await agentTab("github")
+     expect(group(agent.groupId)!.title).toBe(`Agents · 1${MARKER}${MARKER}`)
